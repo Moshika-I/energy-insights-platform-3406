@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Repo-based E2E smoke check for preview env.
+# - Minimal stdout (only final PASS/FAIL + brief hints)
+# - Writes all step responses to /tmp artifacts
+# - Can optionally start local services when URLs are not provided
+
+ARTIFACT_DIR="${SMOKE_ARTIFACT_DIR:-/tmp/smoke-check}"
+mkdir -p "$ARTIFACT_DIR"
+
+# Allow callers to provide URLs for already-running services.
+# If not provided, this script will start them locally (best-effort) in background.
+: "${BACKEND_BASE_URL:=}"
+: "${ANALYTICS_BASE_URL:=}"
+: "${ALERTING_BASE_URL:=}"
+
+# Env vars required by services when started locally:
+# - backend_api_service: POSTGRES_URL, BACKEND_API_KEY, ANALYTICS_SERVICE_URL, ALERTING_SERVICE_URL
+# - analytics_service:  POSTGRES_URL
+# - alerting_service:   POSTGRES_URL
+#
+# NOTE: We intentionally do not print env values.
+
+PIDS=()
+cleanup() {
+  for pid in "${PIDS[@]:-}"; do
+    kill "$pid" >/dev/null 2>&1 || true
+  done
+}
+trap cleanup EXIT
+
+wait_http() {
+  local url="$1"
+  local attempts="${2:-60}"
+  local sleep_s="${3:-0.25}"
+  for _ in $(seq 1 "$attempts"); do
+    if curl -fsS "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "$sleep_s"
+  done
+  return 1
+}
+
+start_if_needed() {
+  local name="$1"
+  local cwd="$2"
+  local port="$3"
+  local health_url="$4"
+  local env_prefix="$5" # additional env assignments (string)
+
+  if curl -fsS "$health_url" >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # Start with minimal logs; uvicorn still prints a few lines, but we redirect to artifact file.
+  local log_file="$ARTIFACT_DIR/${name}.log"
+  (cd "$cwd" && env -i bash -lc "
+    set -e
+    # Re-import current env, but keep it minimal and explicit:
+    export PATH=\"$PATH\"
+    export HOME=\"$HOME\"
+    export PYTHONUNBUFFERED=1
+    $env_prefix
+    python -m uvicorn src.api.main:app --host 0.0.0.0 --port $port
+  " ) >"$log_file" 2>&1 &
+
+  local pid=$!
+  PIDS+=("$pid")
+
+  if ! wait_http "$health_url" 80 0.25; then
+    echo "FAIL: $name did not become healthy. See $log_file" >"$ARTIFACT_DIR/failure.txt"
+    return 1
+  fi
+}
+
+# Decide ports for local boot
+BACKEND_PORT="${BACKEND_PORT:-8000}"
+ANALYTICS_PORT="${ANALYTICS_PORT:-8001}"
+ALERTING_PORT="${ALERTING_PORT:-8002}"
+
+if [[ -z "$BACKEND_BASE_URL" ]]; then BACKEND_BASE_URL="http://127.0.0.1:${BACKEND_PORT}"; fi
+if [[ -z "$ANALYTICS_BASE_URL" ]]; then ANALYTICS_BASE_URL="http://127.0.0.1:${ANALYTICS_PORT}"; fi
+if [[ -z "$ALERTING_BASE_URL" ]]; then ALERTING_BASE_URL="http://127.0.0.1:${ALERTING_PORT}"; fi
+
+# If services are not already reachable, try to start them.
+# IMPORTANT: This assumes the preview env includes python deps already installed for each service.
+if ! curl -fsS "${ANALYTICS_BASE_URL}/" >/dev/null 2>&1; then
+  start_if_needed \
+    "analytics_service" \
+    "../energy-insights-platform-3407/analytics_service" \
+    "$ANALYTICS_PORT" \
+    "${ANALYTICS_BASE_URL}/" \
+    "export POSTGRES_URL=\"${POSTGRES_URL:-}\""
+fi
+
+if ! curl -fsS "${ALERTING_BASE_URL}/" >/dev/null 2>&1; then
+  start_if_needed \
+    "alerting_service" \
+    "../energy-insights-platform-3408/alerting_service" \
+    "$ALERTING_PORT" \
+    "${ALERTING_BASE_URL}/" \
+    "export POSTGRES_URL=\"${POSTGRES_URL:-}\""
+fi
+
+if ! curl -fsS "${BACKEND_BASE_URL}/" >/dev/null 2>&1; then
+  # Backend needs to know downstream service URLs.
+  start_if_needed \
+    "backend_api_service" \
+    "./backend_api_service" \
+    "$BACKEND_PORT" \
+    "${BACKEND_BASE_URL}/" \
+    "export POSTGRES_URL=\"${POSTGRES_URL:-}\"
+     export BACKEND_API_KEY=\"${BACKEND_API_KEY:-}\"
+     export ANALYTICS_SERVICE_URL=\"${ANALYTICS_BASE_URL}\"
+     export ALERTING_SERVICE_URL=\"${ALERTING_BASE_URL}\""
+fi
+
+# Run the actual smoke flow (python client) and store artifacts
+SMOKE_ENV_EXPORTS=(
+  "BACKEND_BASE_URL=${BACKEND_BASE_URL}"
+  "BACKEND_API_KEY=${BACKEND_API_KEY:-}"
+)
+
+# Run with minimal stdout; python script itself will be quiet.
+if ! (cd "./backend_api_service" && env "${SMOKE_ENV_EXPORTS[@]}" python -m src.api.smoke_check \
+  --artifact-dir "$ARTIFACT_DIR"); then
+  echo "FAIL (see $ARTIFACT_DIR)" >&2
+  exit 1
+fi
+
+echo "PASS (artifacts in $ARTIFACT_DIR)"

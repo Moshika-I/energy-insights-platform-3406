@@ -5,6 +5,16 @@ set -euo pipefail
 # - Minimal stdout (only final PASS/FAIL + brief hints)
 # - Writes all step responses to /tmp artifacts
 # - Can optionally start local services when URLs are not provided
+#
+# Env overrides:
+#   - SMOKE_ARTIFACT_DIR: artifact output dir (default: /tmp/smoke-check)
+#   - POSTGRES_URL: full credentialed connection string used by services started locally.
+#       If not set, we attempt to read it from ../energy-insights-platform-3410/database/db_connection.txt.
+#       Expected file format: "psql postgresql://user:pass@host:port/dbname"
+#   - BACKEND_API_KEY: required for the smoke flow client (and backend when started locally)
+#   - BACKEND_BASE_URL / ANALYTICS_BASE_URL / ALERTING_BASE_URL:
+#       if set, script will NOT start that service and will instead use the provided URL.
+#   - BACKEND_PORT / ANALYTICS_PORT / ALERTING_PORT: ports used when starting services locally.
 
 ARTIFACT_DIR="${SMOKE_ARTIFACT_DIR:-/tmp/smoke-check}"
 mkdir -p "$ARTIFACT_DIR"
@@ -15,14 +25,12 @@ mkdir -p "$ARTIFACT_DIR"
 : "${ANALYTICS_BASE_URL:=}"
 : "${ALERTING_BASE_URL:=}"
 
-# Env vars required by services when started locally:
-# - backend_api_service: POSTGRES_URL, BACKEND_API_KEY, ANALYTICS_SERVICE_URL, ALERTING_SERVICE_URL
-# - analytics_service:  POSTGRES_URL
-# - alerting_service:   POSTGRES_URL
-#
-# NOTE: We intentionally do not print env values.
+# NOTE: We intentionally do not print sensitive env values.
 
 PIDS=()
+PID_NAMES=()
+PID_LOGS=()
+
 cleanup() {
   for pid in "${PIDS[@]:-}"; do
     kill "$pid" >/dev/null 2>&1 || true
@@ -30,11 +38,53 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# If any backgrounded service process exits, fail fast rather than hanging in waits/curls.
+monitor_pids() {
+  for i in "${!PIDS[@]}"; do
+    local pid="${PIDS[$i]}"
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+      # Process already exited; treat as failure.
+      echo "FAIL: ${PID_NAMES[$i]} crashed (pid=$pid). See ${PID_LOGS[$i]}" >"$ARTIFACT_DIR/failure.txt"
+      return 1
+    fi
+  done
+  return 0
+}
+
+# Extract "postgresql://..." from db_connection.txt (which typically starts with "psql ").
+default_postgres_url() {
+  local conn_file="../energy-insights-platform-3410/database/db_connection.txt"
+  if [[ -n "${POSTGRES_URL:-}" ]]; then
+    echo "${POSTGRES_URL}"
+    return 0
+  fi
+  if [[ -f "$conn_file" ]]; then
+    # shellcheck disable=SC2002
+    local line
+    line="$(head -n 1 "$conn_file" | tr -d '\r\n')"
+    # remove optional leading "psql " prefix
+    line="${line#psql }"
+    if [[ "$line" == postgresql://* ]]; then
+      echo "$line"
+      return 0
+    fi
+  fi
+
+  # Safe fallback (still credentialed) based on known local dev defaults.
+  # Caller can override via POSTGRES_URL env var.
+  echo "postgresql://appuser:dbuser123@localhost:5000/myapp"
+  return 0
+}
+
 wait_http() {
   local url="$1"
   local attempts="${2:-60}"
   local sleep_s="${3:-0.25}"
   for _ in $(seq 1 "$attempts"); do
+    # fail fast if any service died while we were waiting
+    if ! monitor_pids; then
+      return 1
+    fi
     if curl -fsS "$url" >/dev/null 2>&1; then
       return 0
     fi
@@ -68,9 +118,14 @@ start_if_needed() {
 
   local pid=$!
   PIDS+=("$pid")
+  PID_NAMES+=("$name")
+  PID_LOGS+=("$log_file")
 
   if ! wait_http "$health_url" 80 0.25; then
-    echo "FAIL: $name did not become healthy. See $log_file" >"$ARTIFACT_DIR/failure.txt"
+    # If it failed because the process crashed, monitor_pids already wrote failure.txt.
+    if [[ ! -f "$ARTIFACT_DIR/failure.txt" ]]; then
+      echo "FAIL: $name did not become healthy. See $log_file" >"$ARTIFACT_DIR/failure.txt"
+    fi
     return 1
   fi
 }
@@ -84,6 +139,9 @@ if [[ -z "$BACKEND_BASE_URL" ]]; then BACKEND_BASE_URL="http://127.0.0.1:${BACKE
 if [[ -z "$ANALYTICS_BASE_URL" ]]; then ANALYTICS_BASE_URL="http://127.0.0.1:${ANALYTICS_PORT}"; fi
 if [[ -z "$ALERTING_BASE_URL" ]]; then ALERTING_BASE_URL="http://127.0.0.1:${ALERTING_PORT}"; fi
 
+# Determine POSTGRES_URL for locally started services.
+POSTGRES_URL_DEFAULT="$(default_postgres_url)"
+
 # If services are not already reachable, try to start them.
 # IMPORTANT: This assumes the preview env includes python deps already installed for each service.
 if ! curl -fsS "${ANALYTICS_BASE_URL}/" >/dev/null 2>&1; then
@@ -92,7 +150,7 @@ if ! curl -fsS "${ANALYTICS_BASE_URL}/" >/dev/null 2>&1; then
     "../energy-insights-platform-3407/analytics_service" \
     "$ANALYTICS_PORT" \
     "${ANALYTICS_BASE_URL}/" \
-    "export POSTGRES_URL=\"${POSTGRES_URL:-}\""
+    "export POSTGRES_URL=\"${POSTGRES_URL_DEFAULT}\""
 fi
 
 if ! curl -fsS "${ALERTING_BASE_URL}/" >/dev/null 2>&1; then
@@ -101,7 +159,7 @@ if ! curl -fsS "${ALERTING_BASE_URL}/" >/dev/null 2>&1; then
     "../energy-insights-platform-3408/alerting_service" \
     "$ALERTING_PORT" \
     "${ALERTING_BASE_URL}/" \
-    "export POSTGRES_URL=\"${POSTGRES_URL:-}\""
+    "export POSTGRES_URL=\"${POSTGRES_URL_DEFAULT}\""
 fi
 
 if ! curl -fsS "${BACKEND_BASE_URL}/" >/dev/null 2>&1; then
@@ -111,10 +169,16 @@ if ! curl -fsS "${BACKEND_BASE_URL}/" >/dev/null 2>&1; then
     "./backend_api_service" \
     "$BACKEND_PORT" \
     "${BACKEND_BASE_URL}/" \
-    "export POSTGRES_URL=\"${POSTGRES_URL:-}\"
+    "export POSTGRES_URL=\"${POSTGRES_URL_DEFAULT}\"
      export BACKEND_API_KEY=\"${BACKEND_API_KEY:-}\"
      export ANALYTICS_SERVICE_URL=\"${ANALYTICS_BASE_URL}\"
      export ALERTING_SERVICE_URL=\"${ALERTING_BASE_URL}\""
+fi
+
+# Final liveness check (also fails fast if any pid already crashed)
+if ! monitor_pids; then
+  echo "FAIL (see $ARTIFACT_DIR)" >&2
+  exit 1
 fi
 
 # Run the actual smoke flow (python client) and store artifacts

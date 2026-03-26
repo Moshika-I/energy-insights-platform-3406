@@ -3,12 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
 
 from src.api.clients.alerting_client import AlertingClient
 from src.api.clients.analytics_client import AnalyticsClient
+from src.api.core.config import get_settings
 from src.api.core.db import get_db, lifespan
 from src.api.core.security import require_api_key
 from src.api.schemas.alerts import AlertOut, AlertTrigger
@@ -44,13 +46,43 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+settings = get_settings()
+
+# Optional Host header validation (recommended in production behind a stable domain)
+_allowed_hosts = [h.strip() for h in (settings.allowed_hosts or "").split(",") if h.strip()]
+if _allowed_hosts:
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=_allowed_hosts)
+
+# Env-based CORS configuration
+_allow_origins = [o.strip() for o in (settings.cors_allow_origins or "").split(",") if o.strip()]
+if not _allow_origins:
+    _allow_origins = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=_allow_origins,
+    allow_credentials=bool(settings.cors_allow_credentials),
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):  # type: ignore[no-untyped-def]
+    """Add lightweight security headers to all responses.
+
+    This is intentionally minimal (no CSP) to avoid breaking the Next.js UI while still
+    providing sensible defaults.
+    """
+    response = await call_next(request)
+
+    if settings.security_headers_enabled:
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Cross-Origin-Resource-Policy", "same-site")
+        # If behind TLS-terminating proxy, HSTS can be enabled there; keep off by default here.
+    return response
 
 
 @app.get("/", tags=["health"], summary="Health check", operation_id="health_check")
@@ -62,6 +94,64 @@ def health_check() -> Dict[str, str]:
         JSON with a simple status message.
     """
     return {"message": "Healthy"}
+
+
+@app.get(
+    "/docs/integration",
+    tags=["health"],
+    summary="Integration notes (env vars + end-to-end flow)",
+    operation_id="integration_notes",
+)
+# PUBLIC_INTERFACE
+def integration_notes() -> Dict[str, Any]:
+    """Integration notes for environment-based configuration and the E2E flow.
+
+    End-to-end flow:
+      1) Create tenant -> POST /auth/tenants
+      2) Create meter  -> POST /ingestion/meters
+      3) Upload readings -> POST /ingestion/readings
+      4) Run analytics -> POST /orchestration/analyze (calls analytics_service)
+      5) If anomaly score high, backend triggers alert -> alerting_service
+      6) UI reads:
+         - meters: GET /ui/meters
+         - KPIs:   GET /ui/analytics/usage-summary and /ui/analytics/benchmarking
+         - alerts: GET /ui/alerts, POST /ui/alerts/{id}/ack
+
+    Required env vars (backend_api_service):
+      - POSTGRES_URL
+      - BACKEND_API_KEY
+      - ANALYTICS_SERVICE_URL
+      - ALERTING_SERVICE_URL
+      - BACKEND_CORS_ALLOW_ORIGINS (optional, default '*')
+      - BACKEND_ALLOWED_HOSTS (optional)
+      - BACKEND_SECURITY_HEADERS_ENABLED (optional, default true)
+
+    Returns:
+        Dictionary with the above notes for quick diagnostics.
+    """
+    s = get_settings()
+    return {
+        "required_env": [
+            "POSTGRES_URL",
+            "BACKEND_API_KEY",
+            "ANALYTICS_SERVICE_URL",
+            "ALERTING_SERVICE_URL",
+        ],
+        "optional_env": [
+            "BACKEND_CORS_ALLOW_ORIGINS",
+            "BACKEND_CORS_ALLOW_CREDENTIALS",
+            "BACKEND_ALLOWED_HOSTS",
+            "BACKEND_SECURITY_HEADERS_ENABLED",
+        ],
+        "configured": {
+            "analytics_service_url_set": bool(s.analytics_service_url),
+            "alerting_service_url_set": bool(s.alerting_service_url),
+            "cors_allow_origins": s.cors_allow_origins,
+            "allowed_hosts": s.allowed_hosts,
+            "security_headers_enabled": bool(s.security_headers_enabled),
+        },
+        "flow": "upload readings -> /orchestration/analyze -> optional alert -> /ui/alerts",
+    }
 
 
 # -----------------------------

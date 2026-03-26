@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime
-from typing import Any, Dict, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -13,9 +13,12 @@ from src.api.core.db import get_db, lifespan
 from src.api.core.security import require_api_key
 from src.api.schemas.alerts import AlertOut, AlertTrigger
 from src.api.schemas.analytics import AnalyticsOutputOut, AnalyticsRequest
+from src.api.schemas.dashboard import BenchmarkingOut, UsageSummaryOut
+from src.api.schemas.documents import DocumentOut
 from src.api.schemas.meters import MeterCreate, MeterOut
 from src.api.schemas.readings import ReadingsIngest
 from src.api.schemas.tenants import TenantCreate, TenantOut
+from src.api.schemas.ui_alerts import UiAlertOut
 from src.api.schemas.users import UserCreate, UserOut
 
 openapi_tags = [
@@ -23,6 +26,7 @@ openapi_tags = [
     {"name": "auth", "description": "Template auth/user provisioning endpoints (API-key protected)."},
     {"name": "ingestion", "description": "Data ingestion endpoints for meters, readings, and documents."},
     {"name": "orchestration", "description": "Orchestration endpoints that call analytics and alerting services."},
+    {"name": "ui", "description": "UI-facing endpoints aligned with frontend client stubs."},
 ]
 
 
@@ -245,8 +249,7 @@ async def upload_document(
     """Upload a document.
 
     Notes:
-    - This template stores the document content in DB as extracted_text placeholder
-      and uses a generated storage_key. In production, this should store to S3/GCS.
+    - Stores extracted_text placeholder and uses a generated storage_key.
 
     Args:
         tenant_id: Tenant UUID (query param).
@@ -260,12 +263,12 @@ async def upload_document(
     db = get_db()
     content = await file.read()
 
-    # Minimal safety checks
     if len(content) > 10 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="File too large (max 10MB)")
 
     storage_key = f"db://documents/{tenant_id}/{datetime.utcnow().isoformat()}_{file.filename}"
 
+    # IMPORTANT: avoid casting NULL to uuid by using CASE expression.
     rows = await db.fetch_all(
         """
         INSERT INTO documents (
@@ -273,10 +276,12 @@ async def upload_document(
             document_type, status, extracted_text
         )
         VALUES (
-            :tenant_id::uuid, :uploaded_by_user_id::uuid, :filename, :content_type, :storage_key, :file_size_bytes,
+            :tenant_id::uuid,
+            CASE WHEN :uploaded_by_user_id IS NULL THEN NULL ELSE :uploaded_by_user_id::uuid END,
+            :filename, :content_type, :storage_key, :file_size_bytes,
             :document_type, 'uploaded', :extracted_text
         )
-        RETURNING id::text AS id, status
+        RETURNING id::text AS id, status, created_at
         """,
         {
             "tenant_id": tenant_id,
@@ -389,7 +394,6 @@ async def run_analytics(payload: AnalyticsRequest) -> AnalyticsOutputOut:
 
     stored_out = AnalyticsOutputOut(**stored[0])
 
-    # Trigger alert if the analytics service says so
     if result.get("should_alert") is True:
         alerting_client = AlertingClient()
         try:
@@ -436,7 +440,283 @@ async def trigger_alert(payload: AlertTrigger) -> AlertOut:
     return AlertOut(**result)
 
 
+# -----------------------------
+# UI-facing endpoints (aligned with frontend stubs)
+# -----------------------------
+
+
+@app.get(
+    "/ui/meters",
+    tags=["ui"],
+    summary="List meters (UI)",
+    operation_id="ui_list_meters",
+    dependencies=[Depends(require_api_key)],
+)
+# PUBLIC_INTERFACE
+async def ui_list_meters(
+    tenant_id: str = Query(..., description="Tenant UUID."),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> List[Dict[str, Any]]:
+    """List meters for the tenant with an optional latest reading timestamp."""
+    db = get_db()
+    rows = await db.fetch_all(
+        """
+        SELECT m.id::text AS id,
+               m.name AS name,
+               (
+                  SELECT MAX(reading_at)
+                  FROM meter_readings mr
+                  WHERE mr.meter_id = m.id
+               ) AS last_reading_at
+        FROM meters m
+        WHERE m.tenant_id = :tenant_id::uuid
+        ORDER BY m.created_at DESC
+        LIMIT :limit OFFSET :offset
+        """,
+        {"tenant_id": tenant_id, "limit": limit, "offset": offset},
+    )
+    # Match frontend stub keys: { id, name, lastReadingAt? }
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        out.append(
+            {
+                "id": r["id"],
+                "name": r["name"],
+                "lastReadingAt": r["last_reading_at"].isoformat() if r.get("last_reading_at") else None,
+            }
+        )
+    return out
+
+
+@app.get(
+    "/ui/documents",
+    tags=["ui"],
+    summary="List documents (UI)",
+    operation_id="ui_list_documents",
+    dependencies=[Depends(require_api_key)],
+    response_model=List[DocumentOut],
+)
+# PUBLIC_INTERFACE
+async def ui_list_documents(
+    tenant_id: str = Query(..., description="Tenant UUID."),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> List[DocumentOut]:
+    """List documents for the tenant."""
+    db = get_db()
+    rows = await db.fetch_all(
+        """
+        SELECT id::text AS id,
+               filename AS name,
+               tags,
+               created_at AS uploaded_at,
+               status
+        FROM documents
+        WHERE tenant_id = :tenant_id::uuid
+          AND status <> 'deleted'
+        ORDER BY created_at DESC
+        LIMIT :limit OFFSET :offset
+        """,
+        {"tenant_id": tenant_id, "limit": limit, "offset": offset},
+    )
+    return [DocumentOut(**r) for r in rows]
+
+
+def _month_window(now_utc: datetime) -> tuple[datetime, datetime]:
+    """Return (start_of_month, now)."""
+    start = now_utc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return start, now_utc
+
+
+def _prev_month_window(now_utc: datetime) -> tuple[datetime, datetime]:
+    """Return (start_prev_month, end_prev_month)."""
+    start_this, _ = _month_window(now_utc)
+    end_prev = start_this - timedelta(microseconds=1)
+    start_prev = end_prev.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return start_prev, end_prev
+
+
+@app.get(
+    "/ui/analytics/usage-summary",
+    tags=["ui"],
+    summary="Get usage summary KPIs (UI)",
+    operation_id="ui_get_usage_summary",
+    dependencies=[Depends(require_api_key)],
+    response_model=UsageSummaryOut,
+)
+# PUBLIC_INTERFACE
+async def ui_get_usage_summary(
+    tenant_id: str = Query(..., description="Tenant UUID."),
+    meter_id: str = Query(..., description="Meter UUID."),
+    cost_per_kwh: float = Query(default=0.15, ge=0, description="Simple cost estimate."),
+) -> UsageSummaryOut:
+    """Compute usage KPI summary for current and previous month and latest anomaly score."""
+    now = datetime.now(timezone.utc)
+    this_start, this_end = _month_window(now)
+    prev_start, prev_end = _prev_month_window(now)
+
+    db = get_db()
+    rows = await db.fetch_all(
+        """
+        SELECT
+          COALESCE(SUM(CASE WHEN reading_at >= :this_start AND reading_at <= :this_end THEN value ELSE 0 END), 0)::float AS this_month,
+          COALESCE(SUM(CASE WHEN reading_at >= :prev_start AND reading_at <= :prev_end THEN value ELSE 0 END), 0)::float AS prev_month
+        FROM meter_readings
+        WHERE tenant_id = :tenant_id::uuid
+          AND meter_id = :meter_id::uuid
+          AND reading_at >= :prev_start
+          AND reading_at <= :this_end
+        """,
+        {
+            "tenant_id": tenant_id,
+            "meter_id": meter_id,
+            "this_start": this_start.isoformat(),
+            "this_end": this_end.isoformat(),
+            "prev_start": prev_start.isoformat(),
+            "prev_end": prev_end.isoformat(),
+        },
+    )
+    this_month = float(rows[0]["this_month"]) if rows else 0.0
+    prev_month = float(rows[0]["prev_month"]) if rows else 0.0
+
+    score = 0.0
+    analytics_client = AnalyticsClient()
+    try:
+        # Use a short window for anomaly score (last 14 days)
+        win_end = now
+        win_start = now - timedelta(days=14)
+        anomaly = await analytics_client.anomalies(
+            {
+                "tenant_id": tenant_id,
+                "meter_id": meter_id,
+                "window_start": win_start.isoformat(),
+                "window_end": win_end.isoformat(),
+                "granularity": "daily",
+            }
+        )
+        score = float(anomaly.get("score") or 0.0)
+    except Exception:
+        # Keep UI stable; anomaly may not be available if not enough data
+        score = 0.0
+    finally:
+        await analytics_client.close()
+
+    return UsageSummaryOut(
+        kWhThisMonth=this_month,
+        kWhLastMonth=prev_month,
+        costThisMonth=this_month * float(cost_per_kwh),
+        anomalyScore=score,
+    )
+
+
+@app.get(
+    "/ui/analytics/benchmarking",
+    tags=["ui"],
+    summary="Get benchmarking metrics (UI)",
+    operation_id="ui_get_benchmarking",
+    dependencies=[Depends(require_api_key)],
+    response_model=BenchmarkingOut,
+)
+# PUBLIC_INTERFACE
+async def ui_get_benchmarking(
+    tenant_id: str = Query(..., description="Tenant UUID."),
+    meter_id: str = Query(..., description="Meter UUID."),
+    window_days: int = Query(default=30, ge=7, le=365, description="Window size in days."),
+) -> BenchmarkingOut:
+    """Fetch benchmarking metrics from analytics_service and map to frontend stub shape."""
+    now = datetime.now(timezone.utc)
+    ws = now - timedelta(days=int(window_days))
+    we = now
+
+    analytics_client = AnalyticsClient()
+    try:
+        bench = await analytics_client.benchmark(
+            {"tenant_id": tenant_id, "meter_id": meter_id, "window_start": ws.isoformat(), "window_end": we.isoformat()}
+        )
+    finally:
+        await analytics_client.close()
+
+    return BenchmarkingOut(
+        percentile=float(bench.get("percentile") or 0.0),
+        peerMedianKwh=float(bench.get("peer_median_daily") or 0.0),
+        yourKwh=float(bench.get("your_avg_daily") or 0.0),
+    )
+
+
+def _map_severity_to_ui(severity: str) -> str:
+    """Map service severity to UI stub severity."""
+    if severity == "critical":
+        return "high"
+    if severity == "warning":
+        return "medium"
+    return "low"
+
+
+@app.get(
+    "/ui/alerts",
+    tags=["ui"],
+    summary="List alerts (UI)",
+    operation_id="ui_list_alerts",
+    dependencies=[Depends(require_api_key)],
+    response_model=List[UiAlertOut],
+)
+# PUBLIC_INTERFACE
+async def ui_list_alerts(
+    tenant_id: str = Query(..., description="Tenant UUID."),
+    user_id: Optional[str] = Query(default=None, description="Optional user UUID."),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> List[UiAlertOut]:
+    """List alerts via alerting_service internal API and map to UI shape."""
+    alerting_client = AlertingClient()
+    try:
+        rows = await alerting_client.list_alerts(
+            {"tenant_id": tenant_id, "user_id": user_id, "limit": limit, "offset": offset}
+        )
+    finally:
+        await alerting_client.close()
+
+    out: List[UiAlertOut] = []
+    for r in rows:
+        status = str(r.get("status") or "open")
+        out.append(
+            UiAlertOut(
+                id=str(r["id"]),
+                severity=_map_severity_to_ui(str(r.get("severity") or "info")),
+                title=str(r.get("title") or ""),
+                description=str(r.get("message") or ""),
+                createdAt=datetime.now(timezone.utc)  # fallback if not provided
+                if r.get("created_at") is None
+                else (
+                    r["created_at"]
+                    if isinstance(r["created_at"], datetime)
+                    else datetime.fromisoformat(str(r["created_at"]).replace("Z", "+00:00"))
+                ),
+                acknowledged=(status == "acknowledged"),
+            )
+        )
+    return out
+
+
+@app.post(
+    "/ui/alerts/{alert_id}/ack",
+    tags=["ui"],
+    summary="Acknowledge an alert (UI)",
+    operation_id="ui_acknowledge_alert",
+    dependencies=[Depends(require_api_key)],
+)
+# PUBLIC_INTERFACE
+async def ui_acknowledge_alert(alert_id: str) -> Dict[str, Any]:
+    """Acknowledge an alert via alerting_service internal API."""
+    alerting_client = AlertingClient()
+    try:
+        return await alerting_client.ack_alert(alert_id)
+    finally:
+        await alerting_client.close()
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(_: Any, exc: Exception) -> JSONResponse:
-    # Keep response predictable for clients
+    """Keep response predictable for clients."""
     return JSONResponse(status_code=500, content={"error": "internal_server_error", "detail": str(exc)})

@@ -11,7 +11,7 @@ from fastapi.responses import JSONResponse
 from src.api.clients.alerting_client import AlertingClient
 from src.api.clients.analytics_client import AnalyticsClient
 from src.api.core.config import get_settings
-from src.api.core.db import get_db, lifespan
+from src.api.core.db import get_request_db, lifespan
 from src.api.core.security import require_api_key
 from src.api.schemas.alerts import AlertOut, AlertTrigger
 from src.api.schemas.analytics import AnalyticsOutputOut, AnalyticsRequest
@@ -168,7 +168,7 @@ def integration_notes() -> Dict[str, Any]:
     response_model=TenantOut,
 )
 # PUBLIC_INTERFACE
-async def create_tenant(payload: TenantCreate) -> TenantOut:
+async def create_tenant(payload: TenantCreate, db=Depends(get_request_db)) -> TenantOut:
     """Create a tenant.
 
     Args:
@@ -177,7 +177,6 @@ async def create_tenant(payload: TenantCreate) -> TenantOut:
     Returns:
         Newly created tenant.
     """
-    db = get_db()
     rows = await db.fetch_all(
         """
         INSERT INTO tenants (name, slug)
@@ -198,7 +197,7 @@ async def create_tenant(payload: TenantCreate) -> TenantOut:
     response_model=UserOut,
 )
 # PUBLIC_INTERFACE
-async def upsert_user(payload: UserCreate) -> UserOut:
+async def upsert_user(payload: UserCreate, db=Depends(get_request_db)) -> UserOut:
     """Create or update a user (upsert) scoped to tenant+email.
 
     Args:
@@ -207,7 +206,6 @@ async def upsert_user(payload: UserCreate) -> UserOut:
     Returns:
         UserOut
     """
-    db = get_db()
     rows = await db.fetch_all(
         """
         INSERT INTO users (tenant_id, email, full_name, auth_subject)
@@ -246,7 +244,7 @@ async def upsert_user(payload: UserCreate) -> UserOut:
     response_model=MeterOut,
 )
 # PUBLIC_INTERFACE
-async def create_meter(payload: MeterCreate) -> MeterOut:
+async def create_meter(payload: MeterCreate, db=Depends(get_request_db)) -> MeterOut:
     """Create a meter.
 
     Args:
@@ -255,7 +253,6 @@ async def create_meter(payload: MeterCreate) -> MeterOut:
     Returns:
         MeterOut
     """
-    db = get_db()
     rows = await db.fetch_all(
         """
         INSERT INTO meters (tenant_id, external_id, name, meter_type, unit, timezone, location)
@@ -282,7 +279,7 @@ async def create_meter(payload: MeterCreate) -> MeterOut:
     dependencies=[Depends(require_api_key)],
 )
 # PUBLIC_INTERFACE
-async def ingest_readings(payload: ReadingsIngest) -> Dict[str, Any]:
+async def ingest_readings(payload: ReadingsIngest, db=Depends(get_request_db)) -> Dict[str, Any]:
     """Batch ingest meter readings.
 
     Validation:
@@ -294,7 +291,6 @@ async def ingest_readings(payload: ReadingsIngest) -> Dict[str, Any]:
     Returns:
         Counts of inserted readings.
     """
-    db = get_db()
 
     inserted = 0
     skipped = 0
@@ -335,6 +331,7 @@ async def upload_document(
     uploaded_by_user_id: Optional[str] = None,
     document_type: str = "unknown",
     file: UploadFile = File(...),
+    db=Depends(get_request_db),
 ) -> Dict[str, Any]:
     """Upload a document.
 
@@ -350,7 +347,6 @@ async def upload_document(
     Returns:
         Document identifiers and status.
     """
-    db = get_db()
     content = await file.read()
 
     if len(content) > 10 * 1024 * 1024:
@@ -401,7 +397,7 @@ async def upload_document(
     response_model=AnalyticsOutputOut,
 )
 # PUBLIC_INTERFACE
-async def run_analytics(payload: AnalyticsRequest) -> AnalyticsOutputOut:
+async def run_analytics(payload: AnalyticsRequest, db=Depends(get_request_db)) -> AnalyticsOutputOut:
     """Orchestrate analytics run.
 
     Steps:
@@ -416,7 +412,6 @@ async def run_analytics(payload: AnalyticsRequest) -> AnalyticsOutputOut:
     Returns:
         Stored AnalyticsOutputOut.
     """
-    db = get_db()
     readings = await db.fetch_all(
         """
         SELECT reading_at, value
@@ -547,9 +542,9 @@ async def ui_list_meters(
     tenant_id: str = Query(..., description="Tenant UUID."),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
+    db=Depends(get_request_db),
 ) -> List[Dict[str, Any]]:
     """List meters for the tenant with an optional latest reading timestamp."""
-    db = get_db()
     rows = await db.fetch_all(
         """
         SELECT m.id::text AS id,
@@ -592,9 +587,9 @@ async def ui_list_documents(
     tenant_id: str = Query(..., description="Tenant UUID."),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    db=Depends(get_request_db),
 ) -> List[DocumentOut]:
     """List documents for the tenant."""
-    db = get_db()
     rows = await db.fetch_all(
         """
         SELECT id::text AS id,
@@ -640,13 +635,13 @@ async def ui_get_usage_summary(
     tenant_id: str = Query(..., description="Tenant UUID."),
     meter_id: str = Query(..., description="Meter UUID."),
     cost_per_kwh: float = Query(default=0.15, ge=0, description="Simple cost estimate."),
+    db=Depends(get_request_db),
 ) -> UsageSummaryOut:
     """Compute usage KPI summary for current and previous month and latest anomaly score."""
     now = datetime.now(timezone.utc)
     this_start, this_end = _month_window(now)
     prev_start, prev_end = _prev_month_window(now)
 
-    db = get_db()
     rows = await db.fetch_all(
         """
         SELECT

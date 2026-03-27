@@ -9,8 +9,8 @@ set -euo pipefail
 # Env overrides:
 #   - SMOKE_ARTIFACT_DIR: artifact output dir (default: /tmp/smoke-check)
 #   - POSTGRES_URL: full credentialed connection string used by services started locally.
-#       If not set, we attempt to read it from ../energy-insights-platform-3410/database/db_connection.txt.
-#       Expected file format: "psql postgresql://user:pass@host:port/dbname"
+#       This should be your Supabase Postgres DSN in preview/prod.
+#       If not set, script falls back to a local-dev default (best-effort).
 #   - BACKEND_API_KEY: required for the smoke flow client (and backend when started locally)
 #   - BACKEND_BASE_URL / ANALYTICS_BASE_URL / ALERTING_BASE_URL:
 #       if set, script will NOT start that service and will instead use the provided URL.
@@ -51,27 +51,15 @@ monitor_pids() {
   return 0
 }
 
-# Extract "postgresql://..." from db_connection.txt (which typically starts with "psql ").
+# Determine DB DSN for locally started services.
+# Supabase migration note: Prefer providing POSTGRES_URL explicitly (Supabase DSN).
 default_postgres_url() {
-  local conn_file="../energy-insights-platform-3410/database/db_connection.txt"
   if [[ -n "${POSTGRES_URL:-}" ]]; then
     echo "${POSTGRES_URL}"
     return 0
   fi
-  if [[ -f "$conn_file" ]]; then
-    # shellcheck disable=SC2002
-    local line
-    line="$(head -n 1 "$conn_file" | tr -d '\r\n')"
-    # remove optional leading "psql " prefix
-    line="${line#psql }"
-    if [[ "$line" == postgresql://* ]]; then
-      echo "$line"
-      return 0
-    fi
-  fi
 
-  # Safe fallback (still credentialed) based on known local dev defaults.
-  # Caller can override via POSTGRES_URL env var.
+  # Best-effort local dev fallback. For preview/prod you should always set POSTGRES_URL.
   echo "postgresql://appuser:dbuser123@localhost:5000/myapp"
   return 0
 }

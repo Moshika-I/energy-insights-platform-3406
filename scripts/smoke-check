@@ -17,6 +17,8 @@ set -euo pipefail
 #   - BACKEND_PORT / ANALYTICS_PORT / ALERTING_PORT: ports used when starting services locally.
 
 ARTIFACT_DIR="${SMOKE_ARTIFACT_DIR:-/tmp/smoke-check}"
+# Clear stale artifacts from previous runs to avoid confusion.
+rm -rf "$ARTIFACT_DIR"
 mkdir -p "$ARTIFACT_DIR"
 
 # Allow callers to provide URLs for already-running services.
@@ -94,11 +96,11 @@ start_if_needed() {
 
   # Start with minimal logs; uvicorn still prints a few lines, but we redirect to artifact file.
   local log_file="$ARTIFACT_DIR/${name}.log"
-  (cd "$cwd" && env -i bash -lc "
+  # Do NOT use `env -i` here: it wipes the environment and can drop required variables
+  # (notably BACKEND_API_KEY) depending on shell behavior. We instead preserve env and
+  # explicitly apply overrides via env_prefix.
+  (cd "$cwd" && bash -lc "
     set -e
-    # Re-import current env, but keep it minimal and explicit:
-    export PATH=\"$PATH\"
-    export HOME=\"$HOME\"
     export PYTHONUNBUFFERED=1
     $env_prefix
     python -m uvicorn src.api.main:app --host 0.0.0.0 --port $port

@@ -96,6 +96,21 @@ def health_check() -> Dict[str, str]:
     return {"message": "Healthy"}
 
 
+@app.get("/healthz", tags=["health"], summary="Health check (healthz)", operation_id="health_check_healthz")
+# PUBLIC_INTERFACE
+def health_check_healthz() -> Dict[str, str]:
+    """Health check endpoint (compat alias).
+
+    The preview/runtime environment may probe `/healthz` (configured via env var
+    HEALTHCHECK_PATH / NEXT_PUBLIC_HEALTHCHECK_PATH). We expose this alias so the
+    service is recognized as healthy without changing the canonical `/` endpoint.
+
+    Returns:
+        JSON with a simple status message.
+    """
+    return {"message": "Healthy"}
+
+
 @app.get(
     "/docs/integration",
     tags=["health"],

@@ -130,6 +130,22 @@ if [[ -z "$ALERTING_BASE_URL" ]]; then ALERTING_BASE_URL="http://127.0.0.1:${ALE
 # Determine POSTGRES_URL for locally started services.
 POSTGRES_URL_DEFAULT="$(default_postgres_url)"
 
+# Ensure BACKEND_API_KEY exists for end-to-end runs.
+# If not provided by caller, generate a temporary key and persist it to artifacts for debugging.
+if [[ -z "${BACKEND_API_KEY:-}" ]]; then
+  if command -v openssl >/dev/null 2>&1; then
+    BACKEND_API_KEY="$(openssl rand -hex 24)"
+  else
+    # Best-effort fallback when openssl isn't available.
+    BACKEND_API_KEY="$(date +%s)-$RANDOM-$RANDOM"
+  fi
+fi
+export BACKEND_API_KEY
+
+# Write the effective key to artifacts (requested for debugging).
+# NOTE: artifact dir defaults to /tmp/smoke-check.
+printf '%s' "${BACKEND_API_KEY}" > "${ARTIFACT_DIR}/BACKEND_API_KEY"
+
 # If services are not already reachable, try to start them.
 # IMPORTANT: This assumes the preview env includes python deps already installed for each service.
 if ! curl -fsS "${ANALYTICS_BASE_URL}/" >/dev/null 2>&1; then
@@ -138,7 +154,8 @@ if ! curl -fsS "${ANALYTICS_BASE_URL}/" >/dev/null 2>&1; then
     "../energy-insights-platform-3407/analytics_service" \
     "$ANALYTICS_PORT" \
     "${ANALYTICS_BASE_URL}/" \
-    "export POSTGRES_URL=\"${POSTGRES_URL_DEFAULT}\""
+    "export POSTGRES_URL=\"${POSTGRES_URL_DEFAULT}\"
+     export BACKEND_API_KEY=\"${BACKEND_API_KEY}\""
 fi
 
 if ! curl -fsS "${ALERTING_BASE_URL}/" >/dev/null 2>&1; then
@@ -147,7 +164,8 @@ if ! curl -fsS "${ALERTING_BASE_URL}/" >/dev/null 2>&1; then
     "../energy-insights-platform-3408/alerting_service" \
     "$ALERTING_PORT" \
     "${ALERTING_BASE_URL}/" \
-    "export POSTGRES_URL=\"${POSTGRES_URL_DEFAULT}\""
+    "export POSTGRES_URL=\"${POSTGRES_URL_DEFAULT}\"
+     export BACKEND_API_KEY=\"${BACKEND_API_KEY}\""
 fi
 
 if ! curl -fsS "${BACKEND_BASE_URL}/" >/dev/null 2>&1; then
@@ -158,7 +176,7 @@ if ! curl -fsS "${BACKEND_BASE_URL}/" >/dev/null 2>&1; then
     "$BACKEND_PORT" \
     "${BACKEND_BASE_URL}/" \
     "export POSTGRES_URL=\"${POSTGRES_URL_DEFAULT}\"
-     export BACKEND_API_KEY=\"${BACKEND_API_KEY:-}\"
+     export BACKEND_API_KEY=\"${BACKEND_API_KEY}\"
      export ANALYTICS_SERVICE_URL=\"${ANALYTICS_BASE_URL}\"
      export ALERTING_SERVICE_URL=\"${ALERTING_BASE_URL}\""
 fi
@@ -172,7 +190,7 @@ fi
 # Run the actual smoke flow (python client) and store artifacts
 SMOKE_ENV_EXPORTS=(
   "BACKEND_BASE_URL=${BACKEND_BASE_URL}"
-  "BACKEND_API_KEY=${BACKEND_API_KEY:-}"
+  "BACKEND_API_KEY=${BACKEND_API_KEY}"
 )
 
 # Run with minimal stdout; python script itself will be quiet.
